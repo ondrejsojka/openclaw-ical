@@ -1,0 +1,58 @@
+{
+  "id": "openclaw-ical",
+  "name": "iCal Calendar",
+  "description": "Read-only agenda reader over ICS subscription feeds (Google, iCloud, Fastmail, Nextcloud).",
+  "version": "0.1.0",
+  "configSchema": {
+    "type": "object",
+    "required": [
+      "calendars"
+    ],
+    "properties": {
+      "calendars": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "required": [
+            "id"
+          ],
+          "properties": {
+            "id": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^[a-z0-9][a-z0-9_-]*$",
+              "description": "Short id the agent uses to select this calendar."
+            },
+            "name": {
+              "type": "string",
+              "description": "Human-friendly label for output."
+            },
+            "url": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Public ICS feed URL (https). Mutually exclusive with secretEnv."
+            },
+            "secretEnv": {
+              "type": "string",
+              "pattern": "^[A-Z][A-Z0-9_]*$",
+              "description": "Env var holding the COMPLETE private feed URL. Preferred over url for feeds with a secret token (Google 'secret address in iCal format'). Mutually exclusive with url."
+            }
+          }
+        },
+        "minItems": 1
+      },
+      "timezone": {
+        "type": "string",
+        "description": "IANA timezone for all-day boundaries, floating times and rendering. Default: host timezone."
+      }
+    }
+  },
+  "activation": {
+    "onStartup": true
+  },
+  "contracts": {
+    "tools": [
+      "ical_events"
+    ]
+  }
+}
