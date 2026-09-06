@@ -10,6 +10,7 @@
  */
 import { Type, type Static } from "typebox";
 import { defineToolPlugin } from "openclaw/plugin-sdk/tool-plugin";
+import { resolveConfiguredSecretInputString } from "openclaw/plugin-sdk/config-runtime";
 
 import {
   FeedCache,
@@ -20,12 +21,22 @@ import {
   DEFAULT_FETCH_TIMEOUT_MS,
   type FeedConfig,
   type FetchLike,
+  type RefResolver,
 } from "./feed.js";
 import { expandFeed, assertParseable, type Occurrence } from "./calendar.js";
 import { localDateString, splitDate, toLocalIso, wallTimeToInstant, addDays, assertValidTimeZone } from "./time.js";
 
 // ---------------------------------------------------------------------------
 // Config schema
+
+const SecretRefConfig = Type.Object(
+  {
+    provider: Type.Optional(Type.String()),
+    source: Type.String({ description: "SecretRef source, e.g. env" }),
+    id: Type.String({ description: "SecretRef id (store entry name)" }),
+  },
+  { description: "OpenClaw SecretRef resolved by the host secrets runtime (0.1.2+)." },
+);
 
 const CalendarConfig = Type.Object({
   id: Type.String({
@@ -35,13 +46,16 @@ const CalendarConfig = Type.Object({
   }),
   name: Type.Optional(Type.String({ description: "Human-friendly label for output." })),
   url: Type.Optional(
-    Type.String({ minLength: 1, description: "Public ICS feed URL (https). Mutually exclusive with secretEnv." }),
+    Type.Union([Type.String({ minLength: 1 }), SecretRefConfig], {
+      description:
+        "ICS feed: public https URL string, OR an OpenClaw SecretRef object resolved by the host secrets runtime (preferred for private feeds like Google's 'secret address in iCal format'). Mutually exclusive with secretEnv.",
+    }),
   ),
   secretEnv: Type.Optional(
     Type.String({
       pattern: "^[A-Z][A-Z0-9_]*$",
       description:
-        "Env var holding the COMPLETE private feed URL. Preferred over url for feeds with a secret token (Google 'secret address in iCal format'). Mutually exclusive with url.",
+        "Legacy alternative to SecretRef url: env var holding the COMPLETE private feed URL. Mutually exclusive with url.",
     }),
   ),
 });
@@ -68,43 +82,47 @@ export interface Runtime {
   cache: FeedCache;
   /** Test seam: inject a fetch implementation instead of global fetch. */
   fetchImpl?: FetchLike;
+  /** Resolves SecretRef urls when supplied by the host runtime (0.1.2+). */
+  resolveRef?: RefResolver;
 }
 
 const MAX_WINDOW_DAYS = 400;
 const MAX_EVENTS = 500;
 
-export function resolveRuntime(
+export async function resolveRuntimeAsync(
   config: PluginConfigT,
   cache: FeedCache = new FeedCache(),
-): Runtime {
+  resolveRef?: RefResolver,
+): Promise<Runtime> {
   const displayTimeZone =
     config.timezone ?? Intl.DateTimeFormat().resolvedOptions().timeZone;
   assertValidTimeZone(displayTimeZone);
   const feeds: FeedConfig[] = config.calendars.map((c) => ({
     id: c.id,
     name: c.name ?? c.id,
-    ...(c.url ? { url: c.url } : {}),
+    ...(c.url !== undefined && c.url !== null ? { url: c.url } : {}),
     ...(c.secretEnv ? { secretEnv: c.secretEnv } : {}),
   }));
   const seen = new Set<string>();
+  const urls: string[] = [];
   for (const f of feeds) {
     if (seen.has(f.id)) throw new Error(`duplicate calendar id "${f.id}"`);
     seen.add(f.id);
     // Fail fast at load time on contradictory/missing URL config.
-    resolveFeedUrl(f);
-  }
-  const urls = feeds.map((f) => {
     try {
-      return resolveFeedUrl(f);
+      urls.push(await resolveFeedUrl(f, resolveRef));
     } catch {
-      return "";
+      urls.push("");
+      // Surface config errors on the original path (sync resolve for config validation).
+      await resolveFeedUrl(f, resolveRef);
     }
-  });
+  }
   return {
     feeds,
     displayTimeZone,
     redact: makeRedactor(urls),
     cache,
+    ...(resolveRef ? { resolveRef } : {}),
   };
 }
 
@@ -153,6 +171,7 @@ async function loadFeeds(
           runtime.cache,
           assertParseable,
           runtime.fetchImpl,
+          runtime.resolveRef,
         );
         if (outcome.stale) {
           result.staleFeeds.push({ feedId: feed.id, ageSeconds: outcome.ageSeconds ?? 0 });
@@ -254,9 +273,6 @@ const EventsParams = Type.Object({
   includeAllDay: Type.Optional(Type.Boolean({ description: "Include all-day events. Default: true." })),
   limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 500 })),
 });
-
-// ---------------------------------------------------------------------------
-// Implementation (exported for tests)
 
 export async function executeEvents(
   params: Static<typeof EventsParams>,
@@ -384,8 +400,24 @@ export default defineToolPlugin({
       description:
         "List calendar events overlapping a window. Times are ISO 8601 with local offset; all-day events carry date-only start/end where end is EXCLUSIVE (the day AFTER the last covered day, per RFC 5545). Answers 'what do I have when?' — including stale/partial/truncated indicators when data is incomplete.",
       parameters: EventsParams,
-      execute: async (params, config) =>
-        executeEvents(params, resolveRuntime(config, sharedCache)),
+      execute: async (params, config, context) => {
+        const resolveRef: RefResolver | undefined = context?.api?.config
+          ? async (ref) => {
+              const out = await resolveConfiguredSecretInputString({
+                config: context.api.config,
+                env: process.env,
+                value: ref,
+                path: `plugins.entries.openclaw-ical.config.calendars[].url`,
+              });
+              if (!out.value) {
+                throw new Error(out.unresolvedRefReason ?? `SecretRef ${ref.id} unresolved`);
+              }
+              return out.value;
+            }
+          : undefined;
+        const runtime = await resolveRuntimeAsync(config, sharedCache, resolveRef);
+        return executeEvents(params, runtime);
+      },
     }),
   ],
 });

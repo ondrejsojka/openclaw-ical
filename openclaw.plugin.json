@@ -2,7 +2,7 @@
   "id": "openclaw-ical",
   "name": "iCal Calendar",
   "description": "Read-only agenda reader over ICS subscription feeds (Google, iCloud, Fastmail, Nextcloud).",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "configSchema": {
     "type": "object",
     "required": [
@@ -28,14 +28,39 @@
               "description": "Human-friendly label for output."
             },
             "url": {
-              "type": "string",
-              "minLength": 1,
-              "description": "Public ICS feed URL (https). Mutually exclusive with secretEnv."
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 1
+                },
+                {
+                  "type": "object",
+                  "required": [
+                    "source",
+                    "id"
+                  ],
+                  "properties": {
+                    "provider": {
+                      "type": "string"
+                    },
+                    "source": {
+                      "type": "string",
+                      "description": "SecretRef source, e.g. env"
+                    },
+                    "id": {
+                      "type": "string",
+                      "description": "SecretRef id (store entry name)"
+                    }
+                  },
+                  "description": "OpenClaw SecretRef resolved by the host secrets runtime (0.1.2+)."
+                }
+              ],
+              "description": "ICS feed: public https URL string, OR an OpenClaw SecretRef object resolved by the host secrets runtime (preferred for private feeds like Google's 'secret address in iCal format'). Mutually exclusive with secretEnv."
             },
             "secretEnv": {
               "type": "string",
               "pattern": "^[A-Z][A-Z0-9_]*$",
-              "description": "Env var holding the COMPLETE private feed URL. Preferred over url for feeds with a secret token (Google 'secret address in iCal format'). Mutually exclusive with url."
+              "description": "Legacy alternative to SecretRef url: env var holding the COMPLETE private feed URL. Mutually exclusive with url."
             }
           }
         },

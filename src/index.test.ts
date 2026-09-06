@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import entry, { executeEvents, resolveRuntime, type Runtime } from "./index.js";
+import entry, { executeEvents, resolveRuntimeAsync, type Runtime } from "./index.js";
 import { getToolPluginMetadata } from "openclaw/plugin-sdk/tool-plugin";
 import { expandFeed, assertParseable, type ExpandConfig } from "./calendar.js";
 import {
@@ -190,7 +190,7 @@ describe("P1 regression: tool OUTPUT passes through the redactor", () => {
       `SUMMARY:Backup at ${url}`,
       "END:VEVENT", "END:VCALENDAR",
     ].join("\r\n");
-    const runtime = resolveRuntime(
+    const runtime = await resolveRuntimeAsync(
       { calendars: [{ id: "t", url }], timezone: TZ },
       new FeedCache(),
     );
@@ -199,6 +199,71 @@ describe("P1 regression: tool OUTPUT passes through the redactor", () => {
     const json = JSON.stringify(result);
     expect(json).not.toContain("private-token-xyz");
     expect(json).toContain("[redacted]");
+  });
+});
+
+describe("SecretRef url (0.1.2)", () => {
+  const ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\nEND:VCALENDAR\r\n";
+
+  it("object url is resolved through the injected ref resolver", async () => {
+    const seen: string[] = [];
+    const runtime = await resolveRuntimeAsync(
+      { calendars: [{ id: "t", url: { source: "env", id: "GOOGLE_ICAL_URL" } }], timezone: TZ },
+      new FeedCache(),
+      async (ref) => {
+        seen.push(`${ref.source}:${ref.id}`);
+        return "https://example.invalid/from-ref/basic.ics";
+      },
+    );
+    runtime.fetchImpl = (async (u: string) => {
+      expect(u).toBe("https://example.invalid/from-ref/basic.ics");
+      return new Response(ics, { status: 200 });
+    }) as never;
+    const result = await executeEvents({ from: "2026-09-05", to: "2026-09-07" }, runtime);
+    expect("error" in result).toBe(false);
+    expect(seen).toContain("env:GOOGLE_ICAL_URL");
+  });
+
+  it("ref resolution failure surfaces as a feed error, not a crash", async () => {
+    const runtime = await resolveRuntimeAsync(
+      { calendars: [{ id: "t", url: { source: "env", id: "MISSING_REF" } }], timezone: TZ },
+      new FeedCache(),
+      async () => {
+        throw new Error("unresolved SecretRef");
+      },
+    ).catch(() => null);
+    // Config-time resolution throws on the fail-fast path; runtime path reports feedErrors.
+    expect(runtime).toBeNull();
+  });
+
+  it("url + secretEnv conflict is still rejected (object url counts as url)", async () => {
+    process.env.ICAL_TEST_SECRET_URL = "https://example.invalid/x.ics";
+    try {
+      await expect(
+        resolveRuntimeAsync(
+          {
+            calendars: [
+              { id: "t", url: { source: "env", id: "A" }, secretEnv: "ICAL_TEST_SECRET_URL" },
+            ],
+          },
+          new FeedCache(),
+          async () => "https://example.invalid/ref.ics",
+        ),
+      ).rejects.toThrow(/either url or secretEnv/);
+    } finally {
+      delete process.env.ICAL_TEST_SECRET_URL;
+    }
+  });
+
+  it("SecretRef url contributes to the redactor needles", async () => {
+    const runtime = await resolveRuntimeAsync(
+      { calendars: [{ id: "t", name: "T", url: { source: "env", id: "R" } }], timezone: TZ },
+      new FeedCache(),
+      async () => "https://example.invalid/secret-needle/basic.ics",
+    );
+    expect(runtime.redact("value https://example.invalid/secret-needle/basic.ics here")).toContain(
+      "[redacted]",
+    );
   });
 });
 
@@ -371,8 +436,8 @@ describe("timezone policy", () => {
 // ---------------------------------------------------------------------------
 
 describe("executeEvents end-to-end (fixture feed through the full pipeline)", () => {
-  function runtimeWith(fixture: string): Runtime {
-    const runtime = resolveRuntime(
+  async function runtimeWith(fixture: string): Promise<Runtime> {
+    const runtime = await resolveRuntimeAsync(
       { calendars: [{ id: "test", name: "Test", url: "https://example.invalid/test.ics" }], timezone: TZ },
       new FeedCache(),
     );
@@ -383,7 +448,7 @@ describe("executeEvents end-to-end (fixture feed through the full pipeline)", ()
   it("lists events in chronological order with one representation per value", async () => {
     const result = await executeEvents(
       { from: "2026-09-05", to: "2026-09-21" },
-      runtimeWith(read("basic.ics")),
+      await runtimeWith(read("basic.ics")),
     );
     expect("error" in result).toBe(false);
     if ("error" in result) return;
@@ -411,7 +476,7 @@ describe("executeEvents end-to-end (fixture feed through the full pipeline)", ()
   });
 
   it("query filters case/diacritics-insensitively; includeAllDay=false drops all-day", async () => {
-    const runtime = runtimeWith(read("basic.ics"));
+    const runtime = await runtimeWith(read("basic.ics"));
     const q = await executeEvents({ from: "2026-09-05", to: "2026-09-21", query: "obed" }, runtime);
     if ("error" in q) throw new Error(q.error);
     expect(q.events).toHaveLength(1);
@@ -419,14 +484,14 @@ describe("executeEvents end-to-end (fixture feed through the full pipeline)", ()
 
     const noAllDay = await executeEvents(
       { from: "2026-09-05", to: "2026-09-21", includeAllDay: false },
-      runtimeWith(read("basic.ics")),
+      await runtimeWith(read("basic.ics")),
     );
     if ("error" in noAllDay) throw new Error(noAllDay.error);
     expect(noAllDay.events.every((e) => !e.allDay)).toBe(true);
   });
 
   it("unknown calendar id produces a helpful error", async () => {
-    const result = await executeEvents({ calendar: "nope" }, runtimeWith(read("basic.ics")));
+    const result = await executeEvents({ calendar: "nope" }, await runtimeWith(read("basic.ics")));
     expect("error" in result).toBe(true);
     if ("error" in result) expect(result.error).toContain("test");
   });
@@ -434,7 +499,7 @@ describe("executeEvents end-to-end (fixture feed through the full pipeline)", ()
   it("window spanning > 400 days is rejected", async () => {
     const result = await executeEvents(
       { from: "2026-01-01", to: "2027-06-01" },
-      runtimeWith(read("basic.ics")),
+      await runtimeWith(read("basic.ics")),
     );
     expect("error" in result).toBe(true);
     if ("error" in result) expect(result.error).toContain("400");
@@ -444,7 +509,7 @@ describe("executeEvents end-to-end (fixture feed through the full pipeline)", ()
     process.env.ICAL_TEST_SECRET_URL = "https://example.invalid/secret/basic.ics";
     let seenUrl = "";
     try {
-      const runtime = resolveRuntime(
+      const runtime = await resolveRuntimeAsync(
         { calendars: [{ id: "s", secretEnv: "ICAL_TEST_SECRET_URL" }], timezone: TZ },
         new FeedCache(),
       );
@@ -463,8 +528,8 @@ describe("executeEvents end-to-end (fixture feed through the full pipeline)", ()
   it("config with BOTH url and secretEnv is rejected at load time", async () => {
     process.env.ICAL_TEST_SECRET_URL = "https://example.invalid/secret/basic.ics";
     try {
-      expect(() =>
-        resolveRuntime(
+      await expect(
+        resolveRuntimeAsync(
           {
             calendars: [
               { id: "s", url: "https://example.invalid/a.ics", secretEnv: "ICAL_TEST_SECRET_URL" },
@@ -472,14 +537,14 @@ describe("executeEvents end-to-end (fixture feed through the full pipeline)", ()
           },
           new FeedCache(),
         ),
-      ).toThrow(/either url or secretEnv/);
+      ).rejects.toThrow(/either url or secretEnv/);
     } finally {
       delete process.env.ICAL_TEST_SECRET_URL;
     }
   });
 
   it("all feeds failing produces an explicit error, not an empty success", async () => {
-    const runtime = resolveRuntime(
+    const runtime = await resolveRuntimeAsync(
       { calendars: [{ id: "t", url: "https://example.invalid/t.ics" }], timezone: TZ },
       new FeedCache(),
     );

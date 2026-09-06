@@ -3,17 +3,36 @@
  *
  * Simplicity contract (2026-09-06, user-endorsed simplification review):
  *  - One fixed TTL and timeout live as constants here; not configurable.
- *  - A calendar's URL comes EITHER from `url` in config OR from `secretEnv`
- *    holding the COMPLETE URL — one whole string, no prefix/suffix assembly.
- *  - Failed refreshes serve the last good copy flagged stale; backoff
- *    (`lastAttempt`) prevents hammering a failing origin, and staleness is
- *    derived from the last SUCCESS, never from the last attempt (P2).
+ *  - A calendar's URL comes from exactly ONE source:
+ *      url  — either a plain https URL string, or an OpenClaw SecretRef
+ *             object ({provider?, source, id}) resolved through the host
+ *             secrets runtime (0.1.2+),
+ *      secretEnv — legacy: env var holding the COMPLETE URL.
+ * url XOR secretEnv; an object `url` needs a ref resolver (provided by the
+ * plugin entry from the OpenClaw runtime context).
  */
+
+/** OpenClaw SecretRef shape ({provider?, source, id}); resolution is host-side. */
+export interface SecretRefLike {
+  provider?: string;
+  source: string;
+  id: string;
+}
+
+export function isSecretRefLike(v: unknown): v is SecretRefLike {
+  return (
+    typeof v === "object" &&
+    v !== null &&
+    typeof (v as { source?: unknown }).source === "string" &&
+    typeof (v as { id?: unknown }).id === "string"
+  );
+}
+
 export interface FeedConfig {
   id: string;
   name: string;
-  /** ICS feed URL — public form. Mutually exclusive with secretEnv. */
-  url?: string;
+  /** ICS feed URL (https) or SecretRef object. Mutually exclusive with secretEnv. */
+  url?: string | SecretRefLike;
   /** Env var holding the COMPLETE feed URL. Mutually exclusive with url. */
   secretEnv?: string;
 }
@@ -120,19 +139,29 @@ export function makeRedactor(urls: string[]): (s: string) => string {
   };
 }
 
-/** Resolve the full feed URL from config plus environment. Never logged. */
-export function resolveFeedUrl(feed: FeedConfig): string {
+export type RefResolver = (ref: SecretRefLike) => Promise<string>;
+
+/** Resolve the full feed URL from config (+ optional SecretRef resolver). Never logged. */
+export async function resolveFeedUrl(
+  feed: FeedConfig,
+  resolveRef?: RefResolver,
+): Promise<string> {
   let raw: string;
   if (feed.secretEnv) {
     const value = process.env[feed.secretEnv];
     if (!value) {
       throw new FeedFetchError(feed.id, `env ${feed.secretEnv} is not set`);
     }
-    if (feed.url) {
+    if (feed.url !== undefined && feed.url !== null && feed.url !== "") {
       throw new FeedFetchError(feed.id, "set either url or secretEnv, not both");
     }
     raw = value.trim();
-  } else if (feed.url) {
+  } else if (isSecretRefLike(feed.url)) {
+    if (!resolveRef) {
+      throw new FeedFetchError(feed.id, "SecretRef url needs a secrets runtime context");
+    }
+    raw = (await resolveRef(feed.url)).trim();
+  } else if (typeof feed.url === "string" && feed.url) {
     raw = feed.url.trim();
   } else {
     throw new FeedFetchError(feed.id, "calendar needs url or secretEnv");
@@ -171,9 +200,10 @@ export async function ensureFeed(
   cache: FeedCache,
   validate?: (raw: string) => void,
   fetchImpl?: FetchLike,
+  runtimeResolveRef?: RefResolver,
 ): Promise<FeedOutcome> {
   const doFetch = fetchImpl ?? fetch;
-  const url = resolveFeedUrl(feed);
+  const url = await resolveFeedUrl(feed, runtimeResolveRef);
   const now = Date.now();
 
   // If this id was reconfigured to a different source URL, the cached bytes
