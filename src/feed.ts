@@ -158,7 +158,12 @@ export async function resolveFeedUrl(
     raw = value.trim();
   } else if (isSecretRefLike(feed.url)) {
     if (!resolveRef) {
-      throw new FeedFetchError(feed.id, "SecretRef url needs a secrets runtime context");
+      throw new FeedFetchError(
+        feed.id,
+        "url is a SecretRef object; the host must resolve it before execution " +
+          "(declare contracts.secretInputs in the plugin manifest and configure " +
+          "url as {source, id} — or use a plain URL / secretEnv)",
+      );
     }
     raw = (await resolveRef(feed.url)).trim();
   } else if (typeof feed.url === "string" && feed.url) {

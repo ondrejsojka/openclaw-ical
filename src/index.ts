@@ -10,7 +10,6 @@
  */
 import { Type, type Static } from "typebox";
 import { defineToolPlugin } from "openclaw/plugin-sdk/tool-plugin";
-import { resolveConfiguredSecretInputString } from "openclaw/plugin-sdk/config-runtime";
 
 import {
   FeedCache,
@@ -400,22 +399,11 @@ export default defineToolPlugin({
       description:
         "List calendar events overlapping a window. Times are ISO 8601 with local offset; all-day events carry date-only start/end where end is EXCLUSIVE (the day AFTER the last covered day, per RFC 5545). Answers 'what do I have when?' — including stale/partial/truncated indicators when data is incomplete.",
       parameters: EventsParams,
-      execute: async (params, config, context) => {
-        const resolveRef: RefResolver | undefined = context?.api?.config
-          ? async (ref) => {
-              const out = await resolveConfiguredSecretInputString({
-                config: context.api.config,
-                env: process.env,
-                value: ref,
-                path: `plugins.entries.openclaw-ical.config.calendars[].url`,
-              });
-              if (!out.value) {
-                throw new Error(out.unresolvedRefReason ?? `SecretRef ${ref.id} unresolved`);
-              }
-              return out.value;
-            }
-          : undefined;
-        const runtime = await resolveRuntimeAsync(config, sharedCache, resolveRef);
+      // SecretRef urls are materialized by the HOST before execute() runs, per
+      // the manifest contract (configContracts.secretInputs). No SDK secret
+      // calls happen in this process — that's what keeps the package scan clean.
+      execute: async (params, config) => {
+        const runtime = await resolveRuntimeAsync(config, sharedCache);
         return executeEvents(params, runtime);
       },
     }),
